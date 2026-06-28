@@ -793,7 +793,14 @@ def main(args: argparse.Namespace, dataset_factory=create_dataset, output_dir_fa
         if rank == 0:
             print("Initialized pipeline")
 
-        load_transformer_checkpoint(pipe.transformer, args)
+        _qckpt = os.environ.get('ARTIFIXER_FP8_CKPT', '')
+        if _qckpt:
+            from torchao.quantization import quantize_, Float8WeightOnlyConfig
+            quantize_(pipe.transformer, Float8WeightOnlyConfig())
+            pipe.transformer.load_state_dict(torch.load(_qckpt, map_location=device, weights_only=False), assign=True)
+            if rank == 0: print(f'[quant] loaded pre-quantized fp8 ckpt: {_qckpt}', flush=True)
+        else:
+            load_transformer_checkpoint(pipe.transformer, args)
         pipe.transformer.eval()
 
         if rank == 0:

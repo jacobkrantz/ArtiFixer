@@ -778,59 +778,105 @@ def process_items_with_context_parallel(
             pipe.transformer.disable_context_parallel()
 
 
-@torch.inference_mode()
-def main(args: argparse.Namespace, dataset_factory=create_dataset, output_dir_factory=get_output_dir):
-    rank, world_size, local_rank = init_distributed(args.distributed_timeout_minutes)
-    device = torch.device(f"cuda:{local_rank}")
+class ArtiFixerCorrector:
+    """Resident inference model: builds the pipe once, corrects any number of splits without reload.
 
-    try:
-        if rank == 0:
-            print(f"Running on {world_size} GPUs, evalset: {args.evalset}")
+    The 14B load (+ optional fp8 quantization) happens in __init__; reuse the instance across
+    episodes/scenes. `main()` is a thin CLI shim over this; programmatic callers should build via
+    `for_reconstructed_colmap(...)` and call `correct_split(...)` per batch.
+    """
 
-        pipe = get_eval_pipe(args, device)
+    def __init__(self, args: argparse.Namespace, *, fp8_ckpt: str | None = None):
+        self.args = args
+        self.rank, self.world_size, self.local_rank = init_distributed(args.distributed_timeout_minutes)
+        self.device = torch.device(f"cuda:{self.local_rank}")
+
+        pipe = get_eval_pipe(args, self.device)
         barrier_if_distributed()
-
-        if rank == 0:
+        if self.rank == 0:
             print("Initialized pipeline")
 
-        _qckpt = os.environ.get('ARTIFIXER_FP8_CKPT', '')
-        if _qckpt:
+        fp8_ckpt = fp8_ckpt if fp8_ckpt is not None else os.environ.get("ARTIFIXER_FP8_CKPT", "")
+        if fp8_ckpt:
             from torchao.quantization import quantize_, Float8WeightOnlyConfig
             quantize_(pipe.transformer, Float8WeightOnlyConfig())
-            pipe.transformer.load_state_dict(torch.load(_qckpt, map_location=device, weights_only=False), assign=True)
-            if rank == 0: print(f'[quant] loaded pre-quantized fp8 ckpt: {_qckpt}', flush=True)
+            pipe.transformer.load_state_dict(
+                torch.load(fp8_ckpt, map_location=self.device, weights_only=False), assign=True)
+            if self.rank == 0:
+                print(f"[quant] loaded pre-quantized fp8 ckpt: {fp8_ckpt}", flush=True)
         else:
             load_transformer_checkpoint(pipe.transformer, args)
         pipe.transformer.eval()
-
-        if rank == 0:
+        if self.rank == 0:
             print("Loaded transformer checkpoint")
 
-        dataset = dataset_factory(args, rank)
-        if rank == 0:
+        self.pipe = pipe
+        self.vae_temporal_scale = pipe.vae.config.scale_factor_temporal
+
+    @classmethod
+    def for_reconstructed_colmap(cls, checkpoint_pt, *, fp8_ckpt: str | None = None,
+                                 num_inference_steps: int = 4, inference_pipeline: str = "kv_cache"):
+        """Build a corrector for the reconstructed_colmap trajectory path.
+
+        split_path/save_dir are dummies here (required by the CLI parser) — they are overridden on
+        every `correct_split` call. --save_frame_outputs_only writes only the pred PNGs and skips
+        the comparison-video encode (an eval-only artifact).
+        """
+        args = parse_args([
+            "--evalset", "reconstructed_colmap",
+            "--checkpoint_pt", str(checkpoint_pt),
+            "--save_dir", ".", "--split_path", os.devnull,
+            "--render_trajectory", "trajectory",
+            "--inference_pipeline", inference_pipeline,
+            "--num_inference_steps", str(num_inference_steps),
+            "--save_frame_outputs_only",
+        ])
+        return cls(args, fp8_ckpt=fp8_ckpt)
+
+    @torch.inference_mode()
+    def correct_split(self, split_path, save_dir, *,
+                      dataset_factory=create_dataset, output_dir_factory=get_output_dir):
+        """Correct every item in `split_path`, writing under `save_dir`. Returns the output dir."""
+        self.args.split_path = Path(split_path)
+        self.args.save_dir = Path(save_dir)
+
+        dataset = dataset_factory(self.args, self.rank)
+        if self.rank == 0:
             print(f"Dataset has {len(dataset)} items")
 
-        output_dir = output_dir_factory(args)
-        if rank == 0:
-            if args.replace_if_exists:
+        output_dir = output_dir_factory(self.args)
+        if self.rank == 0:
+            if self.args.replace_if_exists:
                 clear_existing_scene_outputs(output_dir, dataset)
             output_dir.mkdir(parents=True, exist_ok=True)
             print(f"Writing outputs to {output_dir}")
-
         barrier_if_distributed()
 
-        process_items_with_context_parallel(pipe, dataset, args, output_dir, rank, world_size, device)
-
+        process_items_with_context_parallel(
+            self.pipe, dataset, self.args, output_dir, self.rank, self.world_size, self.device)
         barrier_if_distributed()
 
-        if rank == 0 and not args.save_frame_outputs_only:
-            finalize_video_outputs(output_dir, fps=args.output_fps, replace=args.replace_if_exists)
+        if self.rank == 0 and not self.args.save_frame_outputs_only:
+            finalize_video_outputs(output_dir, fps=self.args.output_fps, replace=self.args.replace_if_exists)
+        return output_dir
 
-        if rank == 0:
-            print("Done!")
-    finally:
+    def close(self):
         if dist.is_initialized():
             dist.destroy_process_group()
+
+
+@torch.inference_mode()
+def main(args: argparse.Namespace, dataset_factory=create_dataset, output_dir_factory=get_output_dir):
+    corrector = ArtiFixerCorrector(args)
+    try:
+        if corrector.rank == 0:
+            print(f"Running on {corrector.world_size} GPUs, evalset: {args.evalset}")
+        corrector.correct_split(args.split_path, args.save_dir,
+                                dataset_factory=dataset_factory, output_dir_factory=output_dir_factory)
+        if corrector.rank == 0:
+            print("Done!")
+    finally:
+        corrector.close()
 
 
 def add_inference_args(parser: argparse.ArgumentParser) -> None:

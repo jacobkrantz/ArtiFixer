@@ -166,7 +166,7 @@ def pipeline_frames_per_block(pipe) -> int:
 def save_image(frame: torch.Tensor, path: Path):
     """Save a single CHW tensor image."""
     image = (frame.cpu().float().clamp(0, 1).permute(1, 2, 0).numpy() * 255).round().astype("uint8")
-    Image.fromarray(image).save(path)
+    Image.fromarray(image).save(path, compress_level=1)  # lossless; much faster than the default level 6
 
 
 def _to_list(value) -> list:
@@ -214,14 +214,17 @@ def expected_video_frame_names(item: dict) -> list[str]:
     return [f"{idx:05d}.png" for idx in frame_indices]
 
 
-def output_kinds(item: dict) -> tuple[str, ...]:
-    return ("pred", "gt", "rendered") if "rgb_gt" in item else ("pred", "rendered")
+def output_kinds(item: dict, frame_outputs_only: bool = False) -> tuple[str, ...]:
+    kinds = ("pred", "gt", "rendered") if "rgb_gt" in item else ("pred", "rendered")
+    # --save_frame_outputs_only skips the rendered copies (only pred, and gt when present, are saved).
+    return tuple(k for k in kinds if k != "rendered") if frame_outputs_only else kinds
 
 
-def output_frames_complete(scene_dir: Path, item: dict) -> bool:
+def output_frames_complete(scene_dir: Path, item: dict, frame_outputs_only: bool = False) -> bool:
     names = expected_output_frame_names(item)
     frames_dir = scene_dir / "frames" / "batch_0000"
-    return all((frames_dir / kind / name).is_file() for kind in output_kinds(item) for name in names)
+    return all((frames_dir / kind / name).is_file()
+               for kind in output_kinds(item, frame_outputs_only) for name in names)
 
 
 def output_video_frames_complete(scene_dir: Path, item: dict) -> bool:
@@ -472,7 +475,7 @@ def process_item(pipe, item, args, output_dir, rank, device, vae_temporal_scale,
     else:
         scene_dir = output_dir / scene_id
 
-    if not args.replace_if_exists and output_frames_complete(scene_dir, item):
+    if not args.replace_if_exists and output_frames_complete(scene_dir, item, args.save_frame_outputs_only):
         if args.save_frame_outputs_only or output_video_frames_complete(scene_dir, item):
             return
 
@@ -584,7 +587,7 @@ def process_item(pipe, item, args, output_dir, rank, device, vae_temporal_scale,
     # Save individual frames
     frames_dir = scene_dir / "frames" / "batch_0000"
     video_frames_dir = scene_dir / "video_frames" / "batch_0000"
-    for subdir in output_kinds(item):
+    for subdir in output_kinds(item, args.save_frame_outputs_only):
         (frames_dir / subdir).mkdir(parents=True, exist_ok=True)
         if not args.save_frame_outputs_only:
             (video_frames_dir / subdir).mkdir(parents=True, exist_ok=True)
@@ -619,7 +622,8 @@ def process_item(pipe, item, args, output_dir, rank, device, vae_temporal_scale,
             save_image(pred_frame, frames_dir / "pred" / fname)
             if gt_frame is not None:
                 save_image(gt_frame, frames_dir / "gt" / fname)
-            save_image(rendered_frame, frames_dir / "rendered" / fname)
+            if not args.save_frame_outputs_only:
+                save_image(rendered_frame, frames_dir / "rendered" / fname)
 
         if not args.save_frame_outputs_only:
             fname = f"{frame_indices[frame_idx]:05d}.png"

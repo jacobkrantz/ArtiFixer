@@ -214,17 +214,17 @@ def expected_video_frame_names(item: dict) -> list[str]:
     return [f"{idx:05d}.png" for idx in frame_indices]
 
 
-def output_kinds(item: dict, frame_outputs_only: bool = False) -> tuple[str, ...]:
+def output_kinds(item: dict, skip_rendered: bool = False) -> tuple[str, ...]:
     kinds = ("pred", "gt", "rendered") if "rgb_gt" in item else ("pred", "rendered")
-    # --save_frame_outputs_only skips the rendered copies (only pred, and gt when present, are saved).
-    return tuple(k for k in kinds if k != "rendered") if frame_outputs_only else kinds
+    # --skip_rendered_frames: the rendered input copies are not written (callers that only read pred).
+    return tuple(k for k in kinds if k != "rendered") if skip_rendered else kinds
 
 
-def output_frames_complete(scene_dir: Path, item: dict, frame_outputs_only: bool = False) -> bool:
+def output_frames_complete(scene_dir: Path, item: dict, skip_rendered: bool = False) -> bool:
     names = expected_output_frame_names(item)
     frames_dir = scene_dir / "frames" / "batch_0000"
     return all((frames_dir / kind / name).is_file()
-               for kind in output_kinds(item, frame_outputs_only) for name in names)
+               for kind in output_kinds(item, skip_rendered) for name in names)
 
 
 def output_video_frames_complete(scene_dir: Path, item: dict) -> bool:
@@ -475,7 +475,7 @@ def process_item(pipe, item, args, output_dir, rank, device, vae_temporal_scale,
     else:
         scene_dir = output_dir / scene_id
 
-    if not args.replace_if_exists and output_frames_complete(scene_dir, item, args.save_frame_outputs_only):
+    if not args.replace_if_exists and output_frames_complete(scene_dir, item, args.skip_rendered_frames):
         if args.save_frame_outputs_only or output_video_frames_complete(scene_dir, item):
             return
 
@@ -587,9 +587,10 @@ def process_item(pipe, item, args, output_dir, rank, device, vae_temporal_scale,
     # Save individual frames
     frames_dir = scene_dir / "frames" / "batch_0000"
     video_frames_dir = scene_dir / "video_frames" / "batch_0000"
-    for subdir in output_kinds(item, args.save_frame_outputs_only):
+    for subdir in output_kinds(item, args.skip_rendered_frames):
         (frames_dir / subdir).mkdir(parents=True, exist_ok=True)
-        if not args.save_frame_outputs_only:
+    if not args.save_frame_outputs_only:
+        for subdir in output_kinds(item):
             (video_frames_dir / subdir).mkdir(parents=True, exist_ok=True)
 
     target_h = item.get("target_h")
@@ -622,7 +623,7 @@ def process_item(pipe, item, args, output_dir, rank, device, vae_temporal_scale,
             save_image(pred_frame, frames_dir / "pred" / fname)
             if gt_frame is not None:
                 save_image(gt_frame, frames_dir / "gt" / fname)
-            if not args.save_frame_outputs_only:
+            if not args.skip_rendered_frames:
                 save_image(rendered_frame, frames_dir / "rendered" / fname)
 
         if not args.save_frame_outputs_only:
@@ -823,8 +824,8 @@ class ArtiFixerCorrector:
         """Build a corrector for the reconstructed_colmap trajectory path.
 
         split_path/save_dir are dummies here (required by the CLI parser) — they are overridden on
-        every `correct_split` call. --save_frame_outputs_only writes only the pred PNGs and skips
-        the comparison-video encode (an eval-only artifact).
+        every `correct_split` call. --save_frame_outputs_only skips the comparison-video encode (an
+        eval-only artifact) and --skip_rendered_frames the rendered/ input copies: callers read pred/ only.
         """
         args = parse_args([
             "--evalset", "reconstructed_colmap",
@@ -834,6 +835,7 @@ class ArtiFixerCorrector:
             "--inference_pipeline", inference_pipeline,
             "--num_inference_steps", str(num_inference_steps),
             "--save_frame_outputs_only",
+            "--skip_rendered_frames",
         ])
         return cls(args, fp8_ckpt=fp8_ckpt)
 
@@ -904,6 +906,11 @@ def add_inference_args(parser: argparse.ArgumentParser) -> None:
         "--save_frame_outputs_only",
         action="store_true",
         help="Only save pred/gt/rendered PNG frames needed for metrics; skip comparison videos and diagnostic videos.",
+    )
+    parser.add_argument(
+        "--skip_rendered_frames",
+        action="store_true",
+        help="Do not write the rendered/ input frames (for callers that only read pred/; metrics need them).",
     )
     parser.add_argument(
         "--distributed_timeout_minutes",
